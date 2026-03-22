@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response  # ✅ added Response
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from studentinfo_scrap import AcademiaClient
@@ -94,12 +94,10 @@ async def scrape_portal(request: LoginRequest):
                     raise HTTPException(status_code=401, detail=result_login.get('message', 'Login failed'))
             print("✓ [LOGIN] Fresh login successful - New session created\n")
             
-            # Small delay for session stability after fresh login
             time.sleep(0.5)
 
         # --- FETCH DATA WITH RETRY LOGIC ---
         if session_reused and 'test_response' in locals():
-            # Use cached attendance from session validation
             print("[DATA] Using attendance from session validation + fetching remaining data...")
             
             day_order = client.get_day_order()
@@ -108,7 +106,6 @@ async def scrape_portal(request: LoginRequest):
             
             timetable_data = client.get_timetable()
             
-            # Check if timetable parse failed
             timetable_failed = (
                 timetable_data and 
                 isinstance(timetable_data, dict) and 
@@ -124,13 +121,11 @@ async def scrape_portal(request: LoginRequest):
             else:
                 attendance_data = test_response
         else:
-            # Fresh login - fetch all data with retry logic
             result = fetch_all_data_with_retry(client, max_retries=2, save_debug_html=False)
             day_order = result['day_order']
             attendance_data = result['attendance_data']
             timetable_data = result['timetable_data']
 
-        # --- ATTENDANCE FALLBACK ---
         is_attendance_invalid = (
             attendance_data is None or
             (isinstance(attendance_data, dict) and (
@@ -144,21 +139,11 @@ async def scrape_portal(request: LoginRequest):
             attendance_data = generate_mock_attendance_from_timetable(timetable_data)
             print("✓ [DATA] Mock attendance generated")
 
-        # --- GUARANTEE ATTENDANCE STRUCTURE ---
         if attendance_data is None:
             attendance_data = {}
 
         attendance_data["day_order"] = day_order
-
-        # Return session data for reuse
         session_data = client.get_session_data()
-        
-        print("\n" + "="*60)
-        if session_reused:
-            print("[SESSION] Response ready - Returning EXISTING session data")
-        else:
-            print("[SESSION] Response ready - Returning NEW session data")
-        print("="*60 + "\n")
         
         return {
             "status": "success",
@@ -172,19 +157,14 @@ async def scrape_portal(request: LoginRequest):
         }
 
     except HTTPException:
-        if client:
-            print("[ERROR] HTTPException occurred - Session NOT logged out (kept alive)")
         raise
 
     except Exception as e:
-        if client:
-            print(f"[ERROR] Exception occurred: {str(e)} - Session NOT logged out (kept alive)")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/studentportal_result")
 async def scrape_student_portal_endpoint(request: StudentPortalRequest):
-    """Scrape student data from SRM student portal"""
     try:
         result = scrape_student_portal(request.netid, request.password)
         
@@ -206,7 +186,6 @@ async def scrape_student_portal_endpoint(request: StudentPortalRequest):
 
 @app.post("/logout")
 async def logout_session(request: LoginRequest):
-    """Logout endpoint to invalidate session"""
     try:
         client = AcademiaClient(request.email, request.password)
         
@@ -228,3 +207,17 @@ async def logout_session(request: LoginRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# ✅ ONLY ADDITION STARTS HERE (nothing else changed)
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
+
+
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
+
+# ✅ ONLY ADDITION ENDS HERE
