@@ -77,7 +77,7 @@ class AcademiaClient:
         self.session.cookies.update(initial_cookies)
         print("[DEBUG] Initial cookies setup completed")
 
-        time.sleep(random.uniform(0.5, 1.5))
+        # removed delay for speed
 
         print("[DEBUG] Attempting to fetch login page for CSRF token...")
         try:
@@ -91,7 +91,7 @@ class AcademiaClient:
                 "serviceurl": f"{self.BASE_URL}/portal/academia-academic-services/redirectFromLogin",
             }
 
-            response = self.session.get(login_page_url, params=params, timeout=30)
+            response = self.session.get(login_page_url, params=params, timeout=15)
             print(f"[DEBUG] Login page response status: {response.status_code}")
             response.raise_for_status()
 
@@ -173,7 +173,7 @@ class AcademiaClient:
 
         try:
             print("[DEBUG] Sending POST request for user lookup...")
-            response = self.session.post(url, headers=self._get_common_headers(), data=data, timeout=30)
+            response = self.session.post(url, headers=self._get_common_headers(), data=data, timeout=15)
             response.raise_for_status()
 
             lookup_data = response.json()
@@ -203,7 +203,7 @@ class AcademiaClient:
         print("Step 2b: Closing active sessions...")
 
         try:
-            response = self.session.get(redirect_uri, timeout=30)
+            response = self.session.get(redirect_uri, timeout=15)
             response.raise_for_status()
             print("✓ Visited sessions reminder page")
         except Exception as e:
@@ -215,7 +215,7 @@ class AcademiaClient:
         headers["Referer"] = redirect_uri
 
         try:
-            response = self.session.delete(delete_url, headers=headers, timeout=30)
+            response = self.session.delete(delete_url, headers=headers, timeout=15)
             response.raise_for_status()
             print(f"✓ Active sessions deleted (Status: {response.status_code})")
         except Exception as e:
@@ -244,7 +244,7 @@ class AcademiaClient:
         }
 
         try:
-            response = self.session.get(next_url, params=next_params, headers=next_headers, timeout=30)
+            response = self.session.get(next_url, params=next_params, headers=next_headers, timeout=15)
             response.raise_for_status()
             print(f"✓ Session closure confirmed (Status: {response.status_code})\n")
             return True
@@ -258,7 +258,7 @@ class AcademiaClient:
         print("Step 2b: Closing blocked sessions...")
 
         try:
-            response = self.session.get(redirect_uri, timeout=30)
+            response = self.session.get(redirect_uri, timeout=15)
             response.raise_for_status()
             print("✓ Visited blocked sessions page")
         except Exception as e:
@@ -270,7 +270,7 @@ class AcademiaClient:
         headers["Referer"] = redirect_uri
 
         try:
-            response = self.session.delete(delete_url, headers=headers, timeout=30)
+            response = self.session.delete(delete_url, headers=headers, timeout=15)
             response.raise_for_status()
             print(f"✓ Blocked sessions deleted (Status: {response.status_code})\n")
             return True
@@ -310,7 +310,7 @@ class AcademiaClient:
         headers["Content-Type"] = "application/json;charset=UTF-8"
 
         try:
-            response = self.session.post(url, headers=headers, params=params, data=body, timeout=30)
+            response = self.session.post(url, headers=headers, params=params, data=body, timeout=15)
             response.raise_for_status()
 
             if response.status_code == 200:
@@ -381,7 +381,7 @@ class AcademiaClient:
                                 final_response = self.session.get(
                                     service_url,
                                     headers=redirect_headers,
-                                    timeout=30,
+                                    timeout=15,
                                 )
 
                                 if final_response.status_code == 200:
@@ -390,25 +390,22 @@ class AcademiaClient:
                                     # 🔥 CRITICAL FIX — ACTIVATE PORTAL SESSION
                                     print("[DEBUG] Activating FULL portal session...")
 
-                                    # STEP 1 — redirect login
+                                    # STEP 1 — REQUIRED (do not remove)
                                     self.session.get(
                                         self.BASE_URL + "/portal/academia-academic-services/redirectFromLogin"
                                     )
 
-                                    # STEP 2 — VERY IMPORTANT (THIS WAS MISSING)
-                                    self.session.get(
+                                    # STEP 2 — LIGHT fallback check (safe)
+                                    test_resp = self.session.get(
                                         self.BASE_URL + "/srm_university/academia-academic-services"
                                     )
 
-                                    # STEP 3 — open attendance page once to establish session
-                                    self.session.get(
-                                        self.BASE_URL + "/srm_university/academia-academic-services/page/My_Attendance"
-                                    )
-
-                                    # optional stabilizer
-                                    self.session.get(self.BASE_URL + "/")
-
-                                    self._activate_portal_mode()
+                                    # Retry only if session not active
+                                    if self._looks_like_login_page(test_resp.text):
+                                        print("[DEBUG] Session not active, retrying activation...")
+                                        self.session.get(
+                                            self.BASE_URL + "/portal/academia-academic-services/redirectFromLogin"
+                                        )
 
                                     self._activate_portal_mode()
                                     return {"success": True}
@@ -486,7 +483,7 @@ class AcademiaClient:
         }
 
         try:
-            response = self.session.get(url, headers=headers, params=params, timeout=30)
+            response = self.session.get(url, headers=headers, params=params, timeout=15)
             if response.status_code in [200, 302, 303]:
                 print("✓ Logout successful!\n")
                 self.session.cookies.clear()
@@ -526,7 +523,7 @@ class AcademiaClient:
         print("Fetching attendance data...")
         # 🔥 CRITICAL FIX — ensure session is active before API call
         print("[DEBUG] Ensuring portal session active...")
-        self.session.get(self.BASE_URL + "/")
+        # removed unnecessary keepalive call
 
         url = f"{self.BASE_URL}/srm_university/academia-academic-services/page/My_Attendance"
 
@@ -534,7 +531,7 @@ class AcademiaClient:
             response = self.session.get(
                 url,
                 headers=self._get_page_headers(referer=f"{self.BASE_URL}/"),
-                timeout=30,
+                timeout=15,
             )
             response.raise_for_status()
 
@@ -564,7 +561,7 @@ class AcademiaClient:
             response = self.session.get(
                 url,
                 headers=self._get_page_headers(referer=f"{self.BASE_URL}/"),
-                timeout=30,
+                timeout=15,
             )
             response.raise_for_status()
 
@@ -594,7 +591,7 @@ class AcademiaClient:
             response = self.session.get(
                 url,
                 headers=self._get_page_headers(referer=f"{self.BASE_URL}/"),
-                timeout=30,
+                timeout=15,
             )
             response.raise_for_status()
 
