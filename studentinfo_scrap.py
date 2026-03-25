@@ -77,7 +77,8 @@ class AcademiaClient:
         self.session.cookies.update(initial_cookies)
         print("[DEBUG] Initial cookies setup completed")
 
-        # removed delay for speed
+        # Add slight delay to simulate human behavior
+        time.sleep(random.uniform(0.5, 1.5))
 
         print("[DEBUG] Attempting to fetch login page for CSRF token...")
         try:
