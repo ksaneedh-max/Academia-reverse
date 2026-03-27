@@ -1,394 +1,239 @@
-import re
-import html
-from typing import Dict, Any
-from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from studentinfo_scrap import AcademiaClient
+from tools.fallback_mock_attendance_data import generate_mock_attendance_from_timetable
+from tools.studentportal_result import scrape_student_portal
+from tools.retry_fetch_failed_login import fetch_all_data_with_retry  # ADD THIS
+from typing import Optional
+import time  # ADD THIS
 
 
-KNOWN_LABELS = {
-    "Registration Number",
-    "Name",
-    "Program",
-    "Department",
-    "Specialization",
-    "Semester",
-    "Batch",
-    "Feedback Status",
-    "Enrollment Status / DOE",
-    "Photo-ID",
-    "Mobile",
-}
+app = FastAPI(title="Academia Scraper API")
+
+origins = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "*",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    session_data: Optional[dict] = None
 
 
-# =========================
-# HELPERS
-# =========================
-def clean_text(val):
-    return html.unescape(str(val)).replace("\\-", "-").strip()
+class StudentPortalRequest(BaseModel):
+    netid: str
+    password: str
 
 
-def safe_int(val):
+@app.post("/scrape")
+async def scrape_portal(request: LoginRequest):
+    client = None
+    session_authenticated = False
+    session_reused = False
+
     try:
-        return int(str(val).strip())
-    except:
-        return 0
+        client = AcademiaClient(request.email, request.password)
+                
+        # --- ATTEMPT SESSION REUSE ---
+        if request.session_data:
+            print("\n" + "="*60)
+            print("[SESSION] Attempting to reuse existing session...")
+            print("="*60)
+            client.load_session_data(request.session_data)
+            
+            try:
+                print("[SESSION] Validating session with lightweight request...")
+                test_response = client.get_attendance()
+                
+                if test_response is not None and (
+                    not isinstance(test_response, dict) or 
+                    (test_response.get("error") != "Could not parse HTML" and "error" not in test_response)
+                ):
+                    print("✓ [SESSION] Session is VALID - Reusing existing session")
+                    session_authenticated = True
+                    session_reused = True
+                else:
+                    print("⚠ [SESSION] Session EXPIRED or INVALID - Falling back to fresh login")
+                    print("[SESSION] Clearing old session data before fresh login...")
+                    client.session.cookies.clear()
+                    client._setup_session()
+            except Exception as e:
+                print(f"⚠ [SESSION] Session validation FAILED: {str(e)}")
+                print("⚠ [SESSION] Falling back to fresh login")
+                print("[SESSION] Clearing old session data before fresh login...")
+                client.session.cookies.clear()
+                client._setup_session()
+        else:
+            print("\n" + "="*60)
+            print("[SESSION] No session data provided - Starting fresh login")
+            print("="*60)
 
+        # --- FALLBACK TO LOGIN ---
+        if not session_authenticated:
+            print("\n[LOGIN] Initiating fresh login flow...")
+            result_lookup = client.lookup_user()
+            result_login = client.login()
+            if not result_lookup or not result_login["success"]:
+                if not result_lookup:
+                    print("✗ [LOGIN] User lookup failed - Cannot proceed with login")
+                    raise HTTPException(status_code=401, detail="User lookup failed check your email id")
+                else:
+                    print(f"✗ [LOGIN] Login failed - {result_login.get('message', 'Unknown error')}")
+                    raise HTTPException(status_code=401, detail=result_login.get('message', 'Login failed'))
+            print("✓ [LOGIN] Fresh login successful - New session created\n")
+            
+            # Small delay for session stability after fresh login
+            time.sleep(0.5)
 
-def safe_float(val):
-    try:
-        return float(str(val).replace("%", "").strip())
-    except:
-        return 0.0
-
-
-# =========================
-# HTML EXTRACTOR
-# =========================
-def extract_html(html_content: str) -> str:
-    try:
-        match = re.search(
-            r"pageSanitizer\.sanitize\((['\"])([\s\S]*?)\1\)",
-            html_content,
-            re.DOTALL,
-        )
-
-        if match:
-            escaped_html = match.group(2)
-
-            html_decoded = re.sub(
-                r'\\x([0-9a-fA-F]{2})',
-                lambda m: chr(int(m.group(1), 16)),
-                escaped_html
+        # --- FETCH DATA WITH RETRY LOGIC ---
+        if session_reused and 'test_response' in locals():
+            # Use cached attendance from session validation
+            print("[DATA] Using attendance from session validation + fetching remaining data...")
+            
+            day_order = client.get_day_order()
+            if not isinstance(day_order, int) or day_order <= 0:
+                day_order = 2
+            
+            timetable_data = client.get_timetable()
+            
+            # Check if timetable parse failed
+            timetable_failed = (
+                timetable_data and 
+                isinstance(timetable_data, dict) and 
+                timetable_data.get('error') == "Could not parse HTML"
             )
+            
+            if timetable_failed:
+                print("[RETRY] Parse failure detected - refetching all data with retry logic...")
+                result = fetch_all_data_with_retry(client, max_retries=2, save_debug_html=False)
+                day_order = result['day_order']
+                attendance_data = result['attendance_data']
+                timetable_data = result['timetable_data']
+            else:
+                attendance_data = test_response
+        else:
+            # Fresh login - fetch all data with retry logic
+            result = fetch_all_data_with_retry(client, max_retries=2, save_debug_html=False)
+            day_order = result['day_order']
+            attendance_data = result['attendance_data']
+            timetable_data = result['timetable_data']
 
-            html_decoded = html_decoded.encode().decode("unicode_escape")
-
-            html_decoded = html_decoded.replace("\\/", "/")
-            html_decoded = html_decoded.replace("\\<", "<")
-            html_decoded = html_decoded.replace("\\>", ">")
-            html_decoded = html_decoded.replace('\\"', '"')
-            html_decoded = html_decoded.replace("\\'", "'")
-
-            html_decoded = html.unescape(html_decoded)
-
-            soup = BeautifulSoup(html_decoded, "html.parser")
-            return str(soup)
-
-    except:
-        pass
-
-    return html_content
-
-
-# =========================
-# ATTENDANCE PARSER
-# =========================
-def parse_attendance(html_content: str) -> Dict[str, Any]:
-    html_decoded = extract_html(html_content)
-    soup = BeautifulSoup(html_decoded, "html.parser")
-
-    data = {
-        "student_info": {},
-        "attendance": {
-            "courses": {},
-            "overall_attendance": 0.0,
-            "total_hours_conducted": 0,
-            "total_hours_absent": 0,
-        },
-        "marks": {},
-        "summary": {},
-    }
-
-    # ---------- STUDENT INFO ----------
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 2:
-            continue
-
-        for i in range(0, len(cells) - 1, 2):
-            label_raw = cells[i].get_text(" ", strip=True)
-            label = label_raw.replace(":", "").strip().lower()
-
-            value = clean_text(cells[i + 1].get_text(" ", strip=True))
-
-            if "registration number" in label:
-                data["student_info"]["registration_number"] = value
-
-            elif label == "name":
-                data["student_info"]["name"] = value
-
-            elif "program" in label:
-                data["student_info"]["program"] = value
-
-            elif "department" in label:
-                data["student_info"]["department"] = value
-
-            elif "specialization" in label:
-                data["student_info"]["specialization"] = value
-
-            elif "semester" in label:
-                data["student_info"]["semester"] = value
-
-            elif "batch" in label:
-                match = re.search(r"\d+", value)
-                if match:
-                    data["student_info"]["batch"] = match.group(0)
-
-            elif "enrollment status" in label:
-                parts = value.split(" / ")
-                if len(parts) == 2:
-                    data["student_info"]["enrollment_status"] = parts[0]
-                    data["student_info"]["enrollment_date"] = parts[1]
-
-    # ---------- ATTENDANCE ----------
-    tables = soup.find_all("table")
-
-    total_conducted = 0
-    total_absent = 0
-
-    for table in tables:
-        text = table.get_text()
-
-        if "Course Code" in text and "Hours Conducted" in text:
-            rows = table.find_all("tr")[1:]
-
-            for row in rows:
-                cells = row.find_all("td")
-                if len(cells) < 9:
-                    continue
-
-                course_code = re.search(r"\d{2}[A-Z]{3}\d{3}[A-Z]", cells[0].text)
-                if not course_code:
-                    continue
-
-                course_code = course_code.group(0)
-                category = cells[2].get_text(strip=True)
-
-                conducted = safe_int(cells[6].text)
-                absent = safe_int(cells[7].text)
-                percentage = safe_float(cells[8].text)
-
-                total_conducted += conducted
-                total_absent += absent
-
-                key = f"{course_code}Regular{category}"
-
-                data["attendance"]["courses"][key] = {
-                    "course_title": cells[1].get_text(strip=True),
-                    "category": category,
-                    "faculty_name": cells[3].get_text(strip=True),
-                    "slot": cells[4].get_text(strip=True),
-                    "room_no": cells[5].get_text(strip=True),
-                    "hours_conducted": conducted,
-                    "hours_absent": absent,
-                    "attendance_percentage": percentage,
-                }
-
-    if total_conducted:
-        data["attendance"]["overall_attendance"] = round(
-            ((total_conducted - total_absent) / total_conducted) * 100, 2
+        # --- ATTENDANCE FALLBACK ---
+        is_attendance_invalid = (
+            attendance_data is None or
+            (isinstance(attendance_data, dict) and (
+                not attendance_data or 
+                attendance_data.get("error") == "Could not parse HTML"
+            ))
         )
 
-    data["attendance"]["total_hours_conducted"] = total_conducted
-    data["attendance"]["total_hours_absent"] = total_absent
+        if is_attendance_invalid and timetable_data and "error" not in timetable_data:
+            print("[DATA] Generating mock attendance from timetable...")
+            attendance_data = generate_mock_attendance_from_timetable(timetable_data)
+            print("✓ [DATA] Mock attendance generated")
 
-    # ---------- MARKS (RESTORED + IMPROVED) ----------
-    # ---------- MARKS (FIXED + SAFE) ----------
-    for table in tables:
-        if "Test Performance" not in table.get_text():
-            continue
+        # --- GUARANTEE ATTENDANCE STRUCTURE ---
+        if attendance_data is None:
+            attendance_data = {}
 
-        rows = table.find_all("tr")[1:]
+        attendance_data["day_order"] = day_order
 
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) < 3:
-                continue
-
-            course_code = re.sub(r"Regular", "", cells[0].get_text(strip=True))
-            course_type = cells[1].get_text(strip=True)
-
-            if not re.match(r"\d{2}[A-Z]{3}\d{3}[A-Z]", course_code):
-                continue
-
-            tests = []
-
-            inner_cells = cells[2].find_all(["td", "div"])
-
-            for c in inner_cells:
-                text = c.get_text("\n", strip=True)
-
-                if not text or "/" not in text:
-                    continue
-
-                lines = text.split("\n")
-
-                if len(lines) < 2:
-                    continue
-
-                try:
-                    name_part = lines[0].strip()
-                    marks_part = lines[1].strip()
-
-                    # Split test name and max marks
-                    if "/" not in name_part:
-                        continue
-
-                    name, maxm = name_part.split("/", 1)
-
-                    name = clean_text(name)  # FIX: removes \-
-                    maxm = safe_float(maxm)
-                    obtained = safe_float(marks_part)
-
-                    if maxm == 0:
-                        percentage = 0
-                    else:
-                        percentage = round((obtained / maxm) * 100, 2)
-
-                    tests.append({
-                        "test_name": name,
-                        "obtained_marks": obtained,
-                        "max_marks": maxm,
-                        "percentage": percentage
-                    })
-
-                except:
-                    continue
-
-            key = course_code + course_type
-
-            data["marks"][key] = {
-                "course_type": course_type,
-                "tests": tests
+        # Return session data for reuse
+        session_data = client.get_session_data()
+        
+        print("\n" + "="*60)
+        if session_reused:
+            print("[SESSION] Response ready - Returning EXISTING session data")
+        else:
+            print("[SESSION] Response ready - Returning NEW session data")
+        print("="*60 + "\n")
+        
+        return {
+            "status": "success",
+            "attendance": attendance_data,
+            "timetable": timetable_data,
+            "session_data": session_data,
+            "session_info": {
+                "session_reused": session_reused,
+                "session_type": "existing" if session_reused else "new"
             }
+        }
 
-    return data
+    except HTTPException:
+        if client:
+            print("[ERROR] HTTPException occurred - Session NOT logged out (kept alive)")
+        raise
 
-# =========================
-# TIMETABLE PARSER
-# =========================
-def parse_timetable(html_content: str) -> Dict[str, Any]:
-    html_decoded = extract_html(html_content)
-    soup = BeautifulSoup(html_decoded, "html.parser")
+    except Exception as e:
+        if client:
+            print(f"[ERROR] Exception occurred: {str(e)} - Session NOT logged out (kept alive)")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    tables = soup.find_all("table")
 
-    data = {
-        "student_info": {
-            "registration_number": "",
-            "name": "",
-            "batch": "",
-            "mobile": "",
-            "program": "",
-            "department": "",
-            "semester": "",
-        },
-        "courses": [],
-        "advisors": {},
-        "total_credits": 0,
-    }
+@app.post("/studentportal_result")
+async def scrape_student_portal_endpoint(request: StudentPortalRequest):
+    """Scrape student data from SRM student portal"""
+    try:
+        result = scrape_student_portal(request.netid, request.password)
+        
+        if result.get('status') == 'error':
+            error_msg = result.get('message', 'Unknown error')
+            if 'credentials' in error_msg.lower():
+                raise HTTPException(status_code=401, detail=error_msg)
+            else:
+                raise HTTPException(status_code=500, detail=error_msg)
+        
+        return result
+    
+    except HTTPException:
+        raise
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # ---------- STUDENT INFO ----------
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 2:
-            continue
 
-        for i in range(0, len(cells) - 1, 2):
+@app.post("/logout")
+async def logout_session(request: LoginRequest):
+    """Logout endpoint to invalidate session"""
+    try:
+        client = AcademiaClient(request.email, request.password)
+        
+        if request.session_data:
+            client.load_session_data(request.session_data)
+        
+        if client.logout():
+            return {
+                "status": "success",
+                "message": "Logged out successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Logout failed")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Logout error: {str(e)}")
 
-            label_raw = cells[i].get_text(" ", strip=True)
-            label = label_raw.replace(":", "").strip().lower()
 
-            value = clean_text(cells[i + 1].get_text(" ", strip=True))
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
-            if "registration number" in label:
-                data["student_info"]["registration_number"] = value
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
 
-            elif label == "name":
-                data["student_info"]["name"] = value
 
-            elif "batch" in label:
-                match = re.search(r"\d+", value)
-                if match:
-                    data["student_info"]["batch"] = match.group(0)
-
-            elif "mobile" in label:
-                data["student_info"]["mobile"] = value
-
-            elif "program" in label:
-                data["student_info"]["program"] = value
-
-            elif "department" in label:
-                data["student_info"]["department"] = value
-
-            elif "semester" in label:
-                data["student_info"]["semester"] = value
-
-    # ---------- COURSES ----------
-    for table in tables:
-        if "Course Code" not in table.get_text():
-            continue
-
-        tds = table.find_all("td")
-        i = 0
-
-        while i + 10 < len(tds):
-            if not tds[i].get_text(strip=True).isdigit():
-                i += 1
-                continue
-
-            data["courses"].append({
-                "s_no": tds[i].get_text(strip=True),
-                "course_code": tds[i + 1].get_text(strip=True),
-                "course_title": tds[i + 2].get_text(strip=True),
-                "credit": safe_int(tds[i + 3].get_text(strip=True)),
-                "regn_type": tds[i + 4].get_text(strip=True),
-                "category": tds[i + 5].get_text(strip=True),
-                "course_type": tds[i + 6].get_text(strip=True),
-                "faculty_name": tds[i + 7].get_text(strip=True),
-                "slot": clean_text(tds[i + 8].get_text(strip=True)),
-                "room_no": tds[i + 9].get_text(strip=True),
-                "academic_year": clean_text(tds[i + 10].get_text(strip=True)),
-            })
-
-            i += 11
-
-    # ---------- ADVISORS ----------
-    for table in tables:
-        if "Faculty Advisor" in table.get_text() and "Academic Advisor" in table.get_text():
-            for td in table.find_all("td"):
-                strong = td.find("strong")
-                if not strong:
-                    continue
-
-                parts = strong.get_text("\n", strip=True).split("\n")
-                if len(parts) < 2:
-                    continue
-
-                name, role = parts[0], parts[1]
-                fonts = td.find_all("font")
-
-                email = fonts[0].get_text(strip=True) if len(fonts) >= 1 else ""
-                phone = fonts[1].get_text(strip=True) if len(fonts) >= 2 else ""
-
-                if "Faculty Advisor" in role:
-                    data["advisors"]["faculty_advisor"] = {
-                        "name": name,
-                        "email": email,
-                        "phone": phone,
-                    }
-
-                elif "Academic Advisor" in role:
-                    data["advisors"]["academic_advisor"] = {
-                        "name": name,
-                        "email": email,
-                        "phone": phone,
-                    }
-
-    # ---------- TOTAL CREDITS ----------
-    seen = set()
-    for c in data["courses"]:
-        if c["course_code"] not in seen:
-            seen.add(c["course_code"])
-            data["total_credits"] += c["credit"]
-
-    return data
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
