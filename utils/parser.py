@@ -1,239 +1,331 @@
-from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-from studentinfo_scrap import AcademiaClient
-from tools.fallback_mock_attendance_data import generate_mock_attendance_from_timetable
-from tools.studentportal_result import scrape_student_portal
-from tools.retry_fetch_failed_login import fetch_all_data_with_retry  # ADD THIS
-from typing import Optional
-import time  # ADD THIS
+import re
+from typing import Dict, Optional, Any, List
+from bs4 import BeautifulSoup
 
 
-app = FastAPI(title="Academia Scraper API")
+def parse_attendance(html_content: str) -> Dict[str, Any]:
+    """Parse attendance HTML to structured JSON matching desired format"""
+    
+    # Extract from the JavaScript escaped content
+    match = re.search(r"innerHTML = pageSanitizer\.sanitize\('(.+?)'\);", html_content, re.DOTALL)
+    if not match:
+        return {"error": "Could not parse HTML"}
+    
+    # Unescape the JavaScript string
 
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "*",
-]
+    escaped_html = match.group(1)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    # Handle JS escape sequences manually
+    html_decoded = escaped_html
+    html_decoded = html_decoded.replace("\\'", "'")
+    html_decoded = html_decoded.replace('\\"', '"')
+    html_decoded = html_decoded.replace('\\/', '/')
+    html_decoded = html_decoded.replace('\\-', '-')
+    html_decoded = html_decoded.replace('\\n', '\n')
+    html_decoded = html_decoded.replace('\\t', '\t')
+    html_decoded = html_decoded.replace('\\r', '\r')
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-    session_data: Optional[dict] = None
+    # Handle \xNN hex escapes
+    html_decoded = re.sub(
+        r'\\x([0-9a-fA-F]{2})',
+        lambda m: chr(int(m.group(1), 16)),
+        html_decoded
+    )
+    
+    soup = BeautifulSoup(html_decoded, 'html.parser')
+    
+    data = {
+        "student_info": {},
+        "attendance": {
+            "courses": {},
+            "overall_attendance": 0.0,
+            "total_hours_conducted": 0,
+            "total_hours_absent": 0
+        },
+        "marks": {},
+        "summary": {}
+    }
+    
+    # Parse student information
+    info_rows = soup.find_all('tr')
+    for row in info_rows:
+        cells = row.find_all('td')
+        if len(cells) >= 2:
+            key_text = cells[0].get_text(strip=True).replace(':', '')
+            value_text = cells[1].get_text(strip=True)
+            
+            if key_text == 'Registration Number':
+                data['student_info']['registration_number'] = value_text
+            elif key_text == 'Name':
+                data['student_info']['name'] = value_text
+            elif key_text == 'Program':
+                data['student_info']['program'] = value_text
+            elif key_text == 'Department':
+                data['student_info']['department'] = value_text
+            elif key_text == 'Specialization':
+                data['student_info']['specialization'] = value_text
+            elif key_text == 'Semester':
+                data['student_info']['semester'] = value_text
+            elif key_text == 'Batch':
+                data['student_info']['batch'] = value_text
+            elif key_text == 'Feedback Status':
+                data['student_info']['feedback_status'] = value_text
+            elif key_text == 'Enrollment Status / DOE':
+                parts = value_text.split(' / ')
+                if len(parts) == 2:
+                    data['student_info']['enrollment_status'] = parts[0]
+                    data['student_info']['enrollment_date'] = parts[1]
+            elif key_text == 'Photo-ID':
+                img_tag = cells[1].find('img')
+                if img_tag and img_tag.get('src'):
+                    data['student_info']['photo_url'] = img_tag.get('src')
+    
+    # Parse attendance courses
+    attendance_table = soup.find('table', {'bgcolor': '#FAFAD2'})
+    if attendance_table:
+        rows = attendance_table.find_all('tr')[1:]  # Skip header
+        total_conducted = 0
+        total_absent = 0
+        
+        for row in rows:
+            cells = row.find_all('td')
+            if len(cells) >= 9:
+                course_code_raw = cells[0].get_text(strip=True)
+                # Extract course code (e.g., "21CSC302J" from "21CSC302J\nRegular")
+                course_code_parts = course_code_raw.split('\n')
+                course_code = course_code_parts[0]
+                registration_type = course_code_parts[1] if len(course_code_parts) > 1 else ''
 
+                # Get category to make truly unique key
+                category = cells[2].get_text(strip=True)
 
-class StudentPortalRequest(BaseModel):
-    netid: str
-    password: str
-
-
-@app.post("/scrape")
-async def scrape_portal(request: LoginRequest):
-    client = None
-    session_authenticated = False
-    session_reused = False
-
-    try:
-        client = AcademiaClient(request.email, request.password)
+                # Create unique key using course_code + category
+                course_key = course_code + category
                 
-        # --- ATTEMPT SESSION REUSE ---
-        if request.session_data:
-            print("\n" + "="*60)
-            print("[SESSION] Attempting to reuse existing session...")
-            print("="*60)
-            client.load_session_data(request.session_data)
-            
-            try:
-                print("[SESSION] Validating session with lightweight request...")
-                test_response = client.get_attendance()
+                hours_conducted = int(cells[6].get_text(strip=True))
+                hours_absent = int(cells[7].get_text(strip=True))
                 
-                if test_response is not None and (
-                    not isinstance(test_response, dict) or 
-                    (test_response.get("error") != "Could not parse HTML" and "error" not in test_response)
-                ):
-                    print("✓ [SESSION] Session is VALID - Reusing existing session")
-                    session_authenticated = True
-                    session_reused = True
-                else:
-                    print("⚠ [SESSION] Session EXPIRED or INVALID - Falling back to fresh login")
-                    print("[SESSION] Clearing old session data before fresh login...")
-                    client.session.cookies.clear()
-                    client._setup_session()
-            except Exception as e:
-                print(f"⚠ [SESSION] Session validation FAILED: {str(e)}")
-                print("⚠ [SESSION] Falling back to fresh login")
-                print("[SESSION] Clearing old session data before fresh login...")
-                client.session.cookies.clear()
-                client._setup_session()
-        else:
-            print("\n" + "="*60)
-            print("[SESSION] No session data provided - Starting fresh login")
-            print("="*60)
-
-        # --- FALLBACK TO LOGIN ---
-        if not session_authenticated:
-            print("\n[LOGIN] Initiating fresh login flow...")
-            result_lookup = client.lookup_user()
-            result_login = client.login()
-            if not result_lookup or not result_login["success"]:
-                if not result_lookup:
-                    print("✗ [LOGIN] User lookup failed - Cannot proceed with login")
-                    raise HTTPException(status_code=401, detail="User lookup failed check your email id")
-                else:
-                    print(f"✗ [LOGIN] Login failed - {result_login.get('message', 'Unknown error')}")
-                    raise HTTPException(status_code=401, detail=result_login.get('message', 'Login failed'))
-            print("✓ [LOGIN] Fresh login successful - New session created\n")
-            
-            # Small delay for session stability after fresh login
-            time.sleep(0.5)
-
-        # --- FETCH DATA WITH RETRY LOGIC ---
-        if session_reused and 'test_response' in locals():
-            # Use cached attendance from session validation
-            print("[DATA] Using attendance from session validation + fetching remaining data...")
-            
-            day_order = client.get_day_order()
-            if not isinstance(day_order, int) or day_order <= 0:
-                day_order = 2
-            
-            timetable_data = client.get_timetable()
-            
-            # Check if timetable parse failed
-            timetable_failed = (
-                timetable_data and 
-                isinstance(timetable_data, dict) and 
-                timetable_data.get('error') == "Could not parse HTML"
+                total_conducted += hours_conducted
+                total_absent += hours_absent
+                
+                data['attendance']['courses'][course_key] = {
+                    'course_title': cells[1].get_text(strip=True),
+                    'category': cells[2].get_text(strip=True),
+                    'faculty_name': cells[3].get_text(strip=True),
+                    'slot': cells[4].get_text(strip=True),
+                    'room_no': cells[5].get_text(strip=True),
+                    'hours_conducted': hours_conducted,
+                    'hours_absent': hours_absent,
+                    'attendance_percentage': float(cells[8].get_text(strip=True)) if cells[8].get_text(strip=True).replace('.','').isdigit() else 0.0
+                }
+        
+        # Calculate overall attendance
+        if total_conducted > 0:
+            data['attendance']['overall_attendance'] = round(
+                ((total_conducted - total_absent) / total_conducted) * 100, 2
             )
-            
-            if timetable_failed:
-                print("[RETRY] Parse failure detected - refetching all data with retry logic...")
-                result = fetch_all_data_with_retry(client, max_retries=2, save_debug_html=False)
-                day_order = result['day_order']
-                attendance_data = result['attendance_data']
-                timetable_data = result['timetable_data']
-            else:
-                attendance_data = test_response
-        else:
-            # Fresh login - fetch all data with retry logic
-            result = fetch_all_data_with_retry(client, max_retries=2, save_debug_html=False)
-            day_order = result['day_order']
-            attendance_data = result['attendance_data']
-            timetable_data = result['timetable_data']
-
-        # --- ATTENDANCE FALLBACK ---
-        is_attendance_invalid = (
-            attendance_data is None or
-            (isinstance(attendance_data, dict) and (
-                not attendance_data or 
-                attendance_data.get("error") == "Could not parse HTML"
-            ))
-        )
-
-        if is_attendance_invalid and timetable_data and "error" not in timetable_data:
-            print("[DATA] Generating mock attendance from timetable...")
-            attendance_data = generate_mock_attendance_from_timetable(timetable_data)
-            print("✓ [DATA] Mock attendance generated")
-
-        # --- GUARANTEE ATTENDANCE STRUCTURE ---
-        if attendance_data is None:
-            attendance_data = {}
-
-        attendance_data["day_order"] = day_order
-
-        # Return session data for reuse
-        session_data = client.get_session_data()
-        
-        print("\n" + "="*60)
-        if session_reused:
-            print("[SESSION] Response ready - Returning EXISTING session data")
-        else:
-            print("[SESSION] Response ready - Returning NEW session data")
-        print("="*60 + "\n")
-        
-        return {
-            "status": "success",
-            "attendance": attendance_data,
-            "timetable": timetable_data,
-            "session_data": session_data,
-            "session_info": {
-                "session_reused": session_reused,
-                "session_type": "existing" if session_reused else "new"
-            }
-        }
-
-    except HTTPException:
-        if client:
-            print("[ERROR] HTTPException occurred - Session NOT logged out (kept alive)")
-        raise
-
-    except Exception as e:
-        if client:
-            print(f"[ERROR] Exception occurred: {str(e)} - Session NOT logged out (kept alive)")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/studentportal_result")
-async def scrape_student_portal_endpoint(request: StudentPortalRequest):
-    """Scrape student data from SRM student portal"""
-    try:
-        result = scrape_student_portal(request.netid, request.password)
-        
-        if result.get('status') == 'error':
-            error_msg = result.get('message', 'Unknown error')
-            if 'credentials' in error_msg.lower():
-                raise HTTPException(status_code=401, detail=error_msg)
-            else:
-                raise HTTPException(status_code=500, detail=error_msg)
-        
-        return result
+        data['attendance']['total_hours_conducted'] = total_conducted
+        data['attendance']['total_hours_absent'] = total_absent
     
-    except HTTPException:
-        raise
+    # Parse internal marks
+    marks_tables = soup.find_all('table', {'border': '1'})
+    for table in marks_tables:
+        if 'Course Code' in table.get_text() and 'Test Performance' in table.get_text():
+            rows = table.find_all('tr')[1:]  # Skip header
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 3:
+                    course_code = cells[0].get_text(strip=True)
+                    course_type = cells[1].get_text(strip=True)
+                    
+                    # **FIX: Validate that this is actually a course code**
+                    # Course codes should match pattern like 21XXX###X
+                    # Skip if it looks like marks data (contains multiple "/")
+                    if not re.match(r'^\d{2}[A-Z]{3}\d{3}[A-Z]$', course_code):
+                        continue
+                    
+                    # Also validate course_type is valid (Theory or Practical)
+                    if course_type not in ['Theory', 'Practical']:
+                        continue
+                    
+                    # Create unique key using course_code + course_type
+                    marks_key = course_code + course_type
+                    
+                    # Parse test performance
+                    performance_cell = cells[2]
+                    tests = []
+                    inner_table = performance_cell.find('table')
+                    if inner_table:
+                        inner_rows = inner_table.find_all('tr')
+                        for inner_row in inner_rows:
+                            inner_cells = inner_row.find_all('td')
+                            for inner_cell in inner_cells:
+                                # Get all text content
+                                text = inner_cell.get_text(separator='\n', strip=True)
+                                lines = [line.strip() for line in text.split('\n') if line.strip()]
+                                
+                                # Parse test name and score
+                                if len(lines) >= 2:
+                                    test_name_line = lines[0]  # e.g., "FT-I/5.00"
+                                    score_line = lines[1]       # e.g., "5.00" or "3.40"
+                                    
+                                    # Extract test name and max marks
+                                    if '/' in test_name_line:
+                                        test_parts = test_name_line.split('/')
+                                        test_name = test_parts[0]
+                                        max_marks = float(test_parts[1]) if test_parts[1].replace('.','').replace('-','').isdigit() else 0.0
+                                        obtained_marks = float(score_line) if score_line.replace('.','').replace('-','').isdigit() else 0.0
+                                        
+                                        tests.append({
+                                            'test_name': test_name,
+                                            'obtained_marks': obtained_marks,
+                                            'max_marks': max_marks,
+                                            'percentage': round((obtained_marks / max_marks) * 100, 2) if max_marks > 0 else 0.0
+                                        })
+                    
+                    # Add to marks dict with unique key
+                    data['marks'][marks_key] = {
+                        'course_type': course_type,
+                        'tests': tests
+                    }
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return data
 
 
-@app.post("/logout")
-async def logout_session(request: LoginRequest):
-    """Logout endpoint to invalidate session"""
-    try:
-        client = AcademiaClient(request.email, request.password)
-        
-        if request.session_data:
-            client.load_session_data(request.session_data)
-        
-        if client.logout():
-            return {
-                "status": "success",
-                "message": "Logged out successfully"
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Logout failed")
+#helper function for parsing timetable data
+def parse_timetable(html_content: str) -> Dict[str, Any]:
+    """Parse timetable HTML to structured JSON with course information"""
+    
+    # Extract from the JavaScript escaped content
+    match = re.search(r"innerHTML = pageSanitizer\.sanitize\('(.+?)'\);", html_content, re.DOTALL)
+    if not match:
+        return {"error": "Could not parse HTML"}
+    
+    # Unescape the JavaScript string - handle \xNN hex escapes
+
+    escaped_html = match.group(1)
+
+    # Handle JS escape sequences manually
+    html_decoded = escaped_html
+    html_decoded = html_decoded.replace("\\'", "'")
+    html_decoded = html_decoded.replace('\\"', '"')
+    html_decoded = html_decoded.replace('\\/', '/')
+    html_decoded = html_decoded.replace('\\-', '-')
+    html_decoded = html_decoded.replace('\\n', '\n')
+    html_decoded = html_decoded.replace('\\t', '\t')
+    html_decoded = html_decoded.replace('\\r', '\r')
+
+    # Handle \xNN hex escapes
+    html_decoded = re.sub(
+        r'\\x([0-9a-fA-F]{2})',
+        lambda m: chr(int(m.group(1), 16)),
+        html_decoded
+    )
+    
+    soup = BeautifulSoup(html_decoded, 'html.parser')
+    
+    data = {
+        "student_info": {
+            "registration_number": "",
+            "name": "",
+            "batch": "",
+            "mobile": "",
+            "program": "",
+            "department": "",
+            "semester": ""
+        },
+        "courses": [],
+        "advisors": {},
+        "total_credits": 0
+    }
+    
+    # Parse student information
+    all_tables = soup.find_all('table')
+    for table in all_tables:
+        rows = table.find_all('tr')
+        for row in rows:
+            cells = row.find_all('td')
+            for i in range(0, len(cells)-1, 2):
+                if i+1 >= len(cells):
+                    break
+                label = cells[i].get_text(strip=True).replace(':', '')
+                value = cells[i+1].get_text(separator=' ', strip=True)
+                value = re.sub(r'\s+', ' ', value)
+                
+                if 'Registration Number' in label:
+                    data['student_info']['registration_number'] = value
+                elif label == 'Name':
+                    data['student_info']['name'] = value
+                elif 'Batch' in label: # This will now catch "Combo / Batch"
+                    data['student_info']['batch'] = value.split("/")[-1].strip()#we are only interested in batch
+                elif label == 'Mobile':
+                    data['student_info']['mobile'] = value
+                elif label == 'Program':
+                    data['student_info']['program'] = value
+                elif 'Department' in label:
+                    data['student_info']['department'] = value
+                elif label == 'Semester':
+                    data['student_info']['semester'] = value
+    
+    # Find and parse course data using regex from the decoded HTML
+    # Pattern to match course rows: </tr><td>NUMBER</td><td>CODE</td>...
+    course_pattern = r'<td>(\d+)</td><td>([^<]+)</td><td>([^<]+)</td><td>(\d+)</td><td>([^<]+)</td><td>([^<]+)</td><td>([^<]+)</td><td>([^<]+)</td><td[^>]*>([^<]+)</td><td>([^<]*)</td><td>([^<]+)</td>'
+    
+    courses_found = re.findall(course_pattern, html_decoded)
+    unique_courses=[]
+    
+    for course_data in courses_found:
+        try:
+            s_no, course_code, course_title, credit, regn_type, category, course_type, faculty_name, slot, room_no, academic_year = course_data
             
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Logout error: {str(e)}")
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
-
-@app.head("/health")
-async def health_head():
-    return Response(status_code=200)
-
-
-@app.head("/")
-async def root_head():
-    return Response(status_code=200)
+            credit_val = int(credit) if credit.isdigit() else 0
+            
+            course = {
+                's_no': s_no,
+                'course_code': course_code.strip(),
+                'course_title': course_title.strip(),
+                'credit': credit_val,
+                'regn_type': regn_type.strip(),
+                'category': category.strip(),
+                'course_type': course_type.strip(),
+                'faculty_name': faculty_name.strip(),
+                'slot': slot.strip(),
+                'room_no': room_no.strip(),
+                'academic_year': academic_year.strip()
+            }
+            
+            data['courses'].append(course)
+            #check if same code already edit before adding:
+            if course['course_code'] not in unique_courses:
+                data['total_credits'] += credit_val
+                unique_courses.append(course['course_code'])
+            
+        except Exception as e:
+            print(f"Error parsing course: {e}")
+            continue
+    
+    # Parse advisors
+    for table in soup.find_all('table'):
+        cells = table.find_all('td', {'align': 'center'})
+        for cell in cells:
+            full_text = cell.get_text(separator='\n', strip=True)
+            lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+            
+            if any('Faculty Advisor' in line for line in lines):
+                advisor_idx = next((i for i, line in enumerate(lines) if 'Faculty Advisor' in line), -1)
+                if advisor_idx > 0:
+                    data['advisors']['faculty_advisor'] = {
+                        'name': lines[advisor_idx - 1],
+                        'email': next((line for line in lines if '@srmist.edu.in' in line), ''),
+                        'phone': next((line for line in lines if line.replace('-','').isdigit() and len(line.replace('-','')) >= 10), '')
+                    }
+            elif any('Academic Advisor' in line for line in lines):
+                advisor_idx = next((i for i, line in enumerate(lines) if 'Academic Advisor' in line), -1)
+                if advisor_idx > 0:
+                    data['advisors']['academic_advisor'] = {
+                        'name': lines[advisor_idx - 1],
+                        'email': next((line for line in lines if '@srmist.edu.in' in line), ''),
+                        'phone': next((line for line in lines if line.replace('-','').isdigit() and len(line.replace('-','')) >= 10), '')
+                    }
+    
+    return data
