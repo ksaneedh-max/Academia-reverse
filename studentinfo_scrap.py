@@ -28,6 +28,7 @@ class AcademiaClient:
         self.email = email
         self.password = password
         self.session = requests.Session()
+        self.session.headers['Connection'] = 'keep-alive'
         self.identifier = None
         self.digest = None
         self.csrf_token = None
@@ -45,7 +46,7 @@ class AcademiaClient:
         # Enhanced browser headers
         print("[DEBUG] Setting up headers and cookies...")
         self.session.headers.update({
-            'User-Agent': random.choice(USER_AGENTS),
+            'User-Agent': USER_AGENTS[0],
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -63,25 +64,14 @@ class AcademiaClient:
         current_time = int(time.time())
         
         initial_cookies = {
-            # Static cookies that worked before
-            '_uetvid': 'b3000840e89c11ef8036e75565fa990c',
-            'zalb_74c3a1eecc': '62cd2f9337f58b07cdaa2f90f0ac1087',
-            'cli_rgn': 'IN',
-            'zalb_f0e8db9d3d': '983d6a65b2f29022f18db52385bfc639',
-            
-            # Dynamic cookies with updated timestamps
-            '_ga': f'GA1.3.390342211.{current_time - 86400}',  # Yesterday
-            '_gid': f'GA1.3.{random.randint(1000000000, 9999999999)}.{current_time}',
-            '_ga_S234BK01XY': f'GS1.3.{current_time}.1.0.{current_time}.60.0.0',
-            '_ga_QNCRQG0GFE': f'GS2.1.s{current_time}$o13$g1$t{current_time + 271}$j58$l0$h0',
-            '_ga_HQWPLLNMKY': f'GS2.3.s{current_time}$o23$g0$t{current_time}$j60$l0$h0',
+            'cli_rgn': 'IN'
         }
         
         self.session.cookies.update(initial_cookies)
         print(f"[DEBUG] Initial cookies setup completed")
         
         # Add slight delay to simulate human behavior
-        time.sleep(random.uniform(0.5, 1.5))
+        time.sleep(random.uniform(0.1, 0.3))
         
         # Visit login page to get fresh CSRF token and session cookies
         print("[DEBUG] Attempting to fetch login page for CSRF token...")
@@ -96,7 +86,7 @@ class AcademiaClient:
                 'serviceurl': f'{self.BASE_URL}/portal/academia-academic-services/redirectFromLogin'
             }
             
-            response = self.session.get(login_page_url, params=params)
+            response = self.session.get(login_page_url, params=params, timeout=(5,10))
             print(f"[DEBUG] Login page response status: {response.status_code}")
             response.raise_for_status()
             
@@ -164,7 +154,7 @@ class AcademiaClient:
         
         try:
             print("[DEBUG] Sending POST request for user lookup...")
-            response = self.session.post(url, headers=self._get_common_headers(), data=data)
+            response = self.session.post(url, headers=self._get_common_headers(), data=data, timeout=(5,10))
             # print(f"[DEBUG] Response status code: {response.status_code}")
             # print(f"[DEBUG] Response headers: {dict(response.headers)}")
             response.raise_for_status()
@@ -212,7 +202,7 @@ class AcademiaClient:
         
         # First, visit the announcement page to get proper session state
         try:
-            response = self.session.get(redirect_uri)
+            response = self.session.get(redirect_uri, timeout=(5,10))
             response.raise_for_status()
             print("✓ Visited sessions reminder page")
         except Exception as e:
@@ -256,7 +246,7 @@ class AcademiaClient:
         }
         
         try:
-            response = self.session.get(next_url, params=next_params, headers=next_headers)
+            response = self.session.get(next_url, params=next_params, headers=next_headers, timeout=(5,10))
             response.raise_for_status()
             print(f"✓ Session closure confirmed (Status: {response.status_code})\n")
             return True
@@ -328,7 +318,7 @@ class AcademiaClient:
         headers['Content-Type'] = 'application/json;charset=UTF-8'
 
         try:
-            response = self.session.post(url, headers=headers, params=params, data=body)
+            response = self.session.post(url, headers=headers, params=params, data=body, timeout=(5,10))
             response.raise_for_status()
 
             if response.status_code == 200:
@@ -405,7 +395,7 @@ class AcademiaClient:
                             try:
                                 final_response = self.session.get(
                                     service_url,
-                                    headers=redirect_headers
+                                    headers=redirect_headers, timeout=(5,10)
                                 )
 
                                 if final_response.status_code == 200:
@@ -485,7 +475,7 @@ class AcademiaClient:
         }
         
         try:
-            response = self.session.get(url, headers=headers, params=params)
+            response = self.session.get(url, headers=headers, params=params, timeout=(5,10))
             if response.status_code in [200, 302, 303]:
                 print("✓ Logout successful!\n")
                 self.session.cookies.clear()  # NOW we clear cookies
@@ -521,7 +511,7 @@ class AcademiaClient:
         url = f'{self.BASE_URL}/srm_university/academia-academic-services/page/My_Attendance'
         
         try:
-            response = self.session.get(url, headers=self._get_page_headers())
+            response = self.session.get(url, headers=self._get_page_headers(), timeout=(5,10))
             response.raise_for_status()
             
             print(f"✓ Attendance data retrieved (Status: {response.status_code})\n")
@@ -538,7 +528,7 @@ class AcademiaClient:
         url = f'{self.BASE_URL}/srm_university/academia-academic-services/page/My_Time_Table_2023_24'
         
         try:
-            response = self.session.get(url, headers=self._get_page_headers())
+            response = self.session.get(url, headers=self._get_page_headers(), timeout=(5,10))
             response.raise_for_status()
             
             print(f"✓ Timetable data retrieved (Status: {response.status_code})\n")
@@ -555,7 +545,7 @@ class AcademiaClient:
         url = f'{self.BASE_URL}/srm_university/academia-academic-services/page/WELCOME'
         
         try:
-            response = self.session.get(url, headers=self._get_page_headers())
+            response = self.session.get(url, headers=self._get_page_headers(), timeout=(5,10))
             response.raise_for_status()
             
             # Search for day order pattern in the response
