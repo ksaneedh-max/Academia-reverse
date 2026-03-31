@@ -6,7 +6,8 @@ from tools.fallback_mock_attendance_data import generate_mock_attendance_from_ti
 from tools.studentportal_result import scrape_student_portal
 from tools.retry_fetch_failed_login import fetch_all_data_with_retry
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor  # ✅ ADDED
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 
 app = FastAPI(title="Academia Scraper API")
@@ -47,35 +48,47 @@ async def scrape_portal(request: LoginRequest):
     try:
         client = AcademiaClient(request.email.strip(), request.password)
 
-        # --- SESSION REUSE ---
+        # --- ATTEMPT SESSION REUSE ---
         if request.session_data:
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print("[SESSION] Attempting to reuse existing session...")
-            print("="*60)
+            print("=" * 60)
 
             client.load_session_data(request.session_data)
 
             try:
-                print("[SESSION] Validating session...")
+                print("[SESSION] Validating session with lightweight request...")
 
-                test_response = client.get_day_order()
+                # Old working validation path:
+                # use attendance fetch as the reuse check.
+                test_response = client.get_attendance()
 
-                if isinstance(test_response, int) and test_response > 0:
+                if test_response is not None and (
+                    not isinstance(test_response, dict)
+                    or (test_response.get("error") != "Could not parse HTML" and "error" not in test_response)
+                ):
                     print("✓ [SESSION] Session is VALID - Reusing existing session")
                     session_authenticated = True
                     session_reused = True
                 else:
-                    raise Exception("Invalid session")
+                    print("⚠ [SESSION] Session EXPIRED or INVALID - Falling back to fresh login")
+                    print("[SESSION] Clearing old session data before fresh login...")
+                    client.session.cookies.clear()
+                    client._setup_session()
 
             except Exception as e:
-                print(f"⚠ [SESSION] Session invalid: {str(e)}")
+                print(f"⚠ [SESSION] Session validation FAILED: {str(e)}")
+                print("⚠ [SESSION] Falling back to fresh login")
+                print("[SESSION] Clearing old session data before fresh login...")
                 client.session.cookies.clear()
                 client._setup_session()
 
         else:
-            print("\n[SESSION] No session data provided - Starting fresh login")
+            print("\n" + "=" * 60)
+            print("[SESSION] No session data provided - Starting fresh login")
+            print("=" * 60)
 
-        # --- LOGIN ---
+        # --- FALLBACK TO LOGIN ---
         if not session_authenticated:
             print("\n[LOGIN] Initiating fresh login flow...")
 
@@ -84,11 +97,16 @@ async def scrape_portal(request: LoginRequest):
 
             if not result_lookup or not result_login["success"]:
                 if not result_lookup:
+                    print("✗ [LOGIN] User lookup failed - Cannot proceed with login")
                     raise HTTPException(status_code=401, detail="User lookup failed check your email id")
                 else:
-                    raise HTTPException(status_code=401, detail=result_login.get('message', 'Login failed'))
+                    print(f"✗ [LOGIN] Login failed - {result_login.get('message', 'Unknown error')}")
+                    raise HTTPException(status_code=401, detail=result_login.get("message", "Login failed"))
 
-            print("✓ [LOGIN] Fresh login successful\n")
+            print("✓ [LOGIN] Fresh login successful - New session created\n")
+
+            # Small delay for session stability after fresh login
+            time.sleep(0.5)
 
         # =========================
         # 🚀 SAFE PARALLEL FETCH
@@ -110,22 +128,22 @@ async def scrape_portal(request: LoginRequest):
             timetable_data = f_tt.result()
 
         # =========================
-        # 🔁 RETRY LOGIC (UNCHANGED)
+        # 🔁 RETRY LOGIC
         # =========================
 
         timetable_failed = (
             timetable_data and
             isinstance(timetable_data, dict) and
-            timetable_data.get('error') == "Could not parse HTML"
+            timetable_data.get("error") == "Could not parse HTML"
         )
 
         if timetable_failed:
             print("[RETRY] Timetable parse failed → retrying full fetch")
             result = fetch_all_data_with_retry(client, max_retries=2, save_debug_html=False)
 
-            day_order = result['day_order']
-            attendance_data = result['attendance_data']
-            timetable_data = result['timetable_data']
+            day_order = result["day_order"]
+            attendance_data = result["attendance_data"]
+            timetable_data = result["timetable_data"]
 
         # --- ATTENDANCE FALLBACK ---
         is_attendance_invalid = (
@@ -150,9 +168,9 @@ async def scrape_portal(request: LoginRequest):
         # --- SESSION DATA ---
         session_data = client.get_session_data()
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print(f"[SESSION] Response ready ({'reused' if session_reused else 'new'})")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
 
         return {
             "status": "success",
@@ -181,9 +199,9 @@ async def scrape_student_portal_endpoint(request: StudentPortalRequest):
     try:
         result = scrape_student_portal(request.netid, request.password)
 
-        if result.get('status') == 'error':
-            error_msg = result.get('message', 'Unknown error')
-            if 'credentials' in error_msg.lower():
+        if result.get("status") == "error":
+            error_msg = result.get("message", "Unknown error")
+            if "credentials" in error_msg.lower():
                 raise HTTPException(status_code=401, detail=error_msg)
             else:
                 raise HTTPException(status_code=500, detail=error_msg)
@@ -199,6 +217,7 @@ async def scrape_student_portal_endpoint(request: StudentPortalRequest):
 
 @app.post("/logout")
 async def logout_session(request: LoginRequest):
+    """Logout endpoint to invalidate session"""
     try:
         client = AcademiaClient(request.email.strip(), request.password)
 
